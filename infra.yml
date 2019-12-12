@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: [AWS::Serverless-2016-10-31, SFNYAML]
+Parameters:
+  DefaultRegions:
+    Type: List<String>
+    Default: ""
+  KmsKeyArn:
+    Type: String
+    Default: ""
+  OutputBucket:
+    Type: String
+    Default: ""
+  OutputKeyPattern:
+    Type: String
+    Default: StepEverywhere/{{ .Function }}/{{ .FunctionQualifier }}/{{ .ExecutionId }}/{{ .AccountId }}/{{ .Region }}.json
+Conditions:
+  CreateBucket: !Equals [!Ref OutputBucket, ""]
+  CreateKey: !Equals [!Ref KmsKeyArn, ""]
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    DeletionPolicy: Retain
+  Key:
+    Type: AWS::KMS::Key
+    Condition: CreateKey
+    Properties:
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-policy
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Action: kms:*
+            Resource: "*"
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          - Sid: Allow encrypt only to role assumer
+            Effect: Deny
+            Action: kms:Encrypt
+            Resource: "*"
+            Principal: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn: !GetAtt AssumeRoleFunctionRole.Arn
+          - Sid: Deny decrypt to cheeky people
+            Effect: Deny
+            Action: kms:Decrypt
+            Resource: "*"
+            Principal: "*"
+            Condition:
+              StringNotEquals:
+                kms:EncryptionContext:Recipient: "${aws:PrincipalArn}"
+  StepRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: !Sub states.${AWS::Region}.amazonaws.com
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GrantCreatorFunction.Arn
+                  - !GetAtt CollectorFunction.Arn
+                  - !GetAtt AssumeRoleFunction.Arn
+                  - !GetAtt GrantRevokerFunction.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                # it would be nice if we could use resource tags instead of a name prefix,
+                # but this isn't possible as at the time of writing.
+                Resource: arn:aws:lambda:*:*:function:StepEverywhere_*
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepRole.Arn
+      DefinitionString:
+        StartAt: Create grant
+        States:
+          Create grant:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt GrantCreatorFunction.Arn
+              Payload:
+                Function.$: $$.Execution.Input.Function
+                ExecutionId.$: $$.Execution.Id
+            ResultPath: $.Grant
+            Next: Collect account ids
+          Collect account ids:
+            Type: Task
+            Resource: !GetAtt CollectorFunction.Arn
+            ResultPath: $.Contexts
+            Next: For each account
+            Catch:
+              - Next: Revoke grant
+                ResultPath: $.Error
+                ErrorEquals: [States.ALL]
+          For each account:
+            Type: Map
+            ItemsPath: $.Contexts.Contexts
+            ResultPath: null
+            Next: Revoke grant
+            Catch:
+              - Next: Revoke grant
+                ResultPath: $.Error
+                ErrorEquals: [States.ALL]
+            Parameters:
+              Context.$: $$.Map.Item.Value
+              ExecutionId.$: $$.Execution.Id
+              Function.$: $$.Execution.Input.Function
+              Grant.$: $.Grant.Payload.GrantToken
+              Grantee.$: $.Grant.Payload.Grantee
+            Iterator:
+              StartAt: Assume role
+              States:
+                Assume role:
+                  Type: Task
+                  Resource: !GetAtt AssumeRoleFunction.Arn
+                  Next: Worker
+                Worker:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters:
+                    FunctionName.$: $$.Execution.Input.Function
+                    Payload:
+                      Context.$: $.Context
+                      Credentials.$: $.Credentials
+                      Payload.$: $$.Execution.Input.Payload
+                  ResultPath: null
+                  End: true
+          Revoke grant:
+            Type: Task
+            Resource: !GetAtt GrantRevokerFunction.Arn
+            Parameters:
+              GrantId.$: $.Grant.Payload.GrantId
+            ResultPath: null
+            End: true
+  CollectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: go1.x
+      Handler: step-everywhere
+      CodeUri: ./step-everywhere
+      MemorySize: 128
+      Timeout: 30
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          Mode: Collector
+          DefaultRegionsCsv: !Join [",", !Ref DefaultRegions]
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Resource: "*"
+              Action: organizations:ListAccounts
+  AssumeRoleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: go1.x
+      Handler: step-everywhere
+      CodeUri: ./step-everywhere
+      MemorySize: 128
+      Timeout: 30
+      AutoPublishAlias: live
+      Role: !GetAtt AssumeRoleFunctionRole.Arn
+      Environment:
+        Variables:
+          Mode: AssumeRole
+          KmsKeyId: !If
+            - CreateKey
+            - !GetAtt Key.Arn
+            - !Ref KmsKeyArn
+          OutputKeyPattern: !Ref OutputKeyPattern
+          RoleSessionPattern: StepEverywhere-{{ .ExecutionId }}
+          OutputBucket: !If
+            - CreateBucket
+            - !Ref Bucket
+            - !Ref OutputBucket
+  AssumeRoleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowThings
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - arn:aws:s3:::${OutputBucket}/*
+                  - OutputBucket: !If
+                      - CreateBucket
+                      - !Ref Bucket
+                      - !Ref OutputBucket
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:ResourceTag/stepeverywhere:assumable: true
+  RoleAssumerKmsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles: [!Ref AssumeRoleFunctionRole]
+      PolicyName: AllowKms
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: kms:Encrypt
+            Resource: !If
+              - CreateKey
+              - !GetAtt Key.Arn
+              - !Ref KmsKeyArn
+  GrantRevokerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: go1.x
+      Handler: step-everywhere
+      CodeUri: ./step-everywhere
+      MemorySize: 128
+      Timeout: 30
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          Mode: GrantRevoker
+          KmsKeyId: !If
+            - CreateKey
+            - !GetAtt Key.Arn
+            - !Ref KmsKeyArn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: kms:RevokeGrant
+              Resource: !If
+                - CreateKey
+                - !GetAtt Key.Arn
+                - !Ref KmsKeyArn
+  GrantCreatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: go1.x
+      Handler: step-everywhere
+      CodeUri: ./step-everywhere
+      MemorySize: 128
+      Timeout: 30
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          Mode: GrantCreator
+          KmsKeyId: !If
+            - CreateKey
+            - !GetAtt Key.Arn
+            - !Ref KmsKeyArn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: kms:CreateGrant
+              Resource: !If
+                - CreateKey
+                - !GetAtt Key.Arn
+                - !Ref KmsKeyArn
+            - Effect: Allow
+              Action: lambda:GetFunction
+              # (as above) it would be nice if we could use resource tags instead of a
+              # name prefix, but this isn't possible as at the time of writing.
+              Resource: arn:aws:lambda:*:*:function:StepEverywhere_*
